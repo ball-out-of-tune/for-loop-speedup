@@ -333,6 +333,29 @@ torch.compile 的价值 = 融合多个 kernel，不是优化单个 kernel
   RMSNorm (already 1 kernel): 5.2x slower ❌
 ```
 
+### 为什么 RMSNorm 的带宽利用率只有 69%？
+
+**写了个对照实验验证——Pure element-wise kernel（读 16 MB + 写 16 MB，零归约、零 syncthreads）：**
+
+| Kernel | 数据量 | 带宽 | 利用率 |
+|---|---|---|---|
+| Pure element-wise (out=x*1.0) | 读 16 + 写 16 MB | **177.8 GB/s** | **92.6%** |
+| RMSNorm | 读 16 + 写 16 MB | 133 GB/s | 69% |
+
+**结果：同样读+写 32 MB，不加归约能到 93%。真凶不是"读写混合"，是 Phase 2 归约阶段 VRAM BUS 完全闲置 + 5 个 `__syncthreads()` 栅栏等待。**
+
+```
+RMSNorm 时间线:
+  Phase 1 (读 x²)  Phase 2 (归约)  Phase 3 (读写)
+  ████████████░░░░░░░░████████████████
+  BUS 忙         BUS 闲!!      BUS 忙
+                 ↑
+          归约在 SM 内部完成, 不碰全局内存
+          BUS 在这段时间就是干等着
+```
+
+**教训：Agent 给出的分析（"读写混合降低 DRAM 效率"）被写代码验证推翻了。写 benchmark 验证 > 相信任何人的推理。**
+
 ---
 
 ## 学习路线与知识体系
