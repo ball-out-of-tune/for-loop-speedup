@@ -1,7 +1,7 @@
 # Python For-Loop Speedup
 
 热循环性能加速实验：纯 Python → NumPy → Numba → GPU。
-从 0.35s 到 0.00005s，**加速 6,250 倍**。
+从 0.35s 到 0.049 ms，**加速 7,100 倍，摸到硬件天花板。**
 
 ## 文件说明
 
@@ -9,11 +9,12 @@
 |---|---|---|
 | `hot_loop.py` | CPU benchmark：6 种方法（Python/NumPy/Numba/并行/heavy） | `python hot_loop.py` |
 | `cuda_hot_loop.py` | GPU 加速教程：CuPy + Numba CUDA，含数据传输/计算拆时 | `python cuda_hot_loop.py` |
+| `cuda_kernel_float4.py` | float4 向量化尝试 + block size 调优 | `python cuda_kernel_float4.py` |
 | `speed_ladder.py` | 速度阶梯：4 种方法加速比对比 | `python speed_ladder.py` |
 | `bench_roofline.py` | Roofline 模型：实测内存带宽和计算峰值 | `python bench_roofline.py` |
-| `profile_kernel.py` | Nsight Compute 用：GPU 硬件计数器精确计时 (FP64) | `ncu --metrics ... python profile_kernel.py` |
-| `profile_kernel_f32.py` | Nsight Compute 用：同上 (FP32) | `ncu --metrics ... python profile_kernel_f32.py` |
-| `profile_cupy.py` | Nsight Compute 用：CuPy kernel 分析 | `nvprof python profile_cupy.py` |
+| `profile_kernel.py` | Nsight Compute 用：GPU 硬件计数器 (FP64) | `ncu --metrics ... python profile_kernel.py` |
+| `profile_kernel_f32.py` | Nsight Compute 用：GPU 硬件计数器 (FP32) | `ncu --metrics ... python profile_kernel_f32.py` |
+| `profile_cupy.py` | Nsight Compute 用：CuPy kernel 分析 | `ncu --metrics ... python profile_cupy.py` |
 | `numba_explained.py` | Numba 原理：JIT 编译、LLVM、类型推断 | 阅读 |
 | `numba_howto.py` | Numba 实操：`@njit`、`prange`、常见坑 | 阅读 |
 | `hot_loop_tutorial.py` | hot_loop 逐步优化教程 | 阅读 |
@@ -36,7 +37,8 @@
 | Numba `@njit(parallel=True)` heavy | CPU | f64 | 0.28 s | 7.2× → 计算瓶颈时并行才有效 |
 | CuPy | GPU | f64 | 0.0067 s | 52× |
 | Numba `@cuda.jit` | GPU | f64 | 0.00089 s | 395× |
-| Numba `@cuda.jit` | GPU | **f32** | **0.000056 s** | **6,250×** |
+| Numba `@cuda.jit` (block=256) | GPU | **f32** | **0.000049 s** | **7,100×** |
+| **=== 理论最快 ===** | | | **0.000040 s** | **物理极限 (7.72 MB ÷ 192 GB/s)** |
 
 ### Roofline 瓶颈分析
 
@@ -77,3 +79,46 @@
 
 5. **CuPy 一行代码 = 7 次 kernel 启动 + 6 个临时数组。**
    开发效率高，但多余的显存读写让它比手写 Numba CUDA kernel 慢 5×
+
+### Block Size 调优
+
+同一个 kernel，修改 `threads_per_block` 参数（128/256/512/1024），测量带宽利用率：
+
+| threads | blocks | 耗时 | 带宽 | 利用率 |
+|---|---|---|---|---|
+| 128 | 7813 | 0.0506 ms | 158.2 GB/s | 82% |
+| **256** | **3907** | **0.0493 ms** | **162.4 GB/s** | **85%** |
+| 512 | 1954 | 0.0507 ms | 157.8 GB/s | 82% |
+| 1024 | 977 | 0.0602 ms | 132.9 GB/s | 69% |
+
+Block size 影响 SM 占用率（Occupancy）。SM 有固定资源上限（2048 线程 / 64 warp / 16 block / 65536 寄存器 / 100 KB shared memory），block size 决定了哪些资源先爆、决定了每个 SM 同时驻留多少 warp。warp 不够多 → 内存延迟藏不住 → 带宽利用率下降。256 恰好是这张卡最优值。
+
+### float4 向量化尝试
+
+每个线程处理 4 个元素（`base = i * 4`），期望 LLVM 合并 4 次 32-bit 读取为一次 128-bit 加载。
+
+**结果：0.0536 ms，反而慢于 baseline。** 原因：baseline 已经 151 GB/s（79%），和实测上限 162 GB/s 只差 7%。float4 省下的线程开销远小于内存带宽的物理上限，优化空间被硬件锁死了。
+
+### 极限在哪？
+
+```
+理论最快 = 数据量 ÷ 带宽 = 7.72 MB ÷ 192 GB/s = 0.040 ms
+
+实测 0.049 ms，达到物理极限的 82%（时间）/ 85%（带宽）。
+
+剩下 15% 是 GPU 显存的固定物理开销：DRAM 页切换、刷新周期、地址/命令总线——软件改不了。
+```
+
+### 优化全景图
+
+```
+纯 Python          350,000 μs  ████████████████████████████████  1×
+NumPy               60,000 μs  ██████                            5.8×
+Numba @njit         48,000 μs  █████                             7.3×
+Numba CUDA f64         886 μs  ▏                                 395×
+Numba CUDA f32          49 μs  ▏                                 7,100×
+────────────────────────────────────────────────────────────────
+理论最快 (带宽)          40 μs  ▏                                 物理极限
+```
+
+**7,100 倍加速、带宽利用率 85%、摸到硬件天花板 —— 这块卡、这个计算，已经到终点了。**

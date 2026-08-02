@@ -84,6 +84,31 @@ def numba_cuda_hot_loop_my_own(data, ans, N):
         x = data[i]
         ans[i] = math.sin(x) ** 2 + math.cos(x) ** 2 + math.sqrt(abs(x))
     
+@cuda.jit
+def cuda_kernel_float4(data, ans, n):
+    """
+    这就是 CUDA 内核。GPU 会启动 n 个线程，每个线程执行这个函数一次。
+
+    cuda.grid(1) 返回"我是第几个线程"，和 Python 的 `for i in range(n)` 里的 i 完全一样。
+    唯一的区别：这里所有线程同时执行，而不是依次执行。
+    """
+    i = cuda.grid(1)        # ← 唯一的新概念！等于 for 循环里的那个 i
+    base = i * 4
+    if base + 3 < n:
+        x0 = data[base]
+        x1 = data[base + 1]
+        x2 = data[base + 2]
+        x3 = data[base + 3]
+
+        ans[base]     = math.sin(x0) ** 2 + math.cos(x0) ** 2 + math.sqrt(abs(x0))
+        ans[base + 1] = math.sin(x1) ** 2 + math.cos(x1) ** 2 + math.sqrt(abs(x1))
+        ans[base + 2] = math.sin(x2) ** 2 + math.cos(x2) ** 2 + math.sqrt(abs(x2))
+        ans[base + 3] = math.sin(x3) ** 2 + math.cos(x3) ** 2 + math.sqrt(abs(x3))
+    
+    else:
+        for j in range(base, n):
+            x = data[j]
+            ans[j] = math.sin(x) ** 2 + math.cos(x) ** 2 + math.sqrt(abs(x))
 
 def bench_numba_cuda():
     """用 Numba 的 @cuda.jit 写 CUDA 内核"""
