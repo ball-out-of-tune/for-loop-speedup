@@ -22,6 +22,8 @@
 | `bench_reduce.cu` | Fair benchmark: 手写 CUDA vs PyTorch reduce | `nvcc -o bench_reduce bench_reduce.cu && ./bench_reduce` |
 | `rms_norm.cu` | CUDA RMSNorm kernel (reduce + element-wise 融合) | `nvcc -o rms_norm_cuda rms_norm.cu && ./rms_norm_cuda` |
 | `rmsnorm_torch.py` | PyTorch RMSNorm benchmark baseline | `python rmsnorm_torch.py` |
+| `softmax.cu` | CUDA Softmax kernel (2 reduces + element-wise) + L2 验证实验 | `nvcc -o softmax_cuda softmax.cu && ./softmax_cuda` |
+| `softmax.py` | PyTorch Softmax benchmark baseline | `python softmax.py` |
 | `trace_torch_sum.py` | 查 torch.sum 底层调了什么 kernel | `python trace_torch_sum.py` |
 | `numba_explained.py` | Numba 原理：JIT 编译、LLVM、类型推断 | 阅读 |
 | `numba_howto.py` | Numba 实操：`@njit`、`prange`、常见坑 | 阅读 |
@@ -358,13 +360,192 @@ RMSNorm 时间线:
 
 ---
 
+## RTX 3050 Ti Laptop GPU 硬件规格
+
+**来源：** `nvidia-smi -q` + `cudaGetDeviceProperties()` + 网络搜索 [TechPowerUp](https://www.techpowerup.com/gpu-specs/geforce-rtx-3050-ti-mobile.c3782) / [WCCFTech](https://wccftech.com/nvidia-geforce-rtx-3050-ti-mobile-gpu-specs-confirmed-in-gpu-z-validation-based-on-the-ampere-ga107-gpu/)
+
+```
+┌──────────────────────────────────────────────────┐
+│              GA107 芯片 (Ampere 架构)              │
+│          Samsung 8nm · Compute Capability 8.6     │
+│                                                    │
+│  ┌──────┐ ┌──────┐         ┌──────┐ ┌──────┐     │
+│  │ SM 0 │ │ SM 1 │  ... 19 │SM 18 │ │SM 19 │     │
+│  │      │ │      │  个 SM  │      │ │      │     │
+│  │128 KB│ │128 KB│         │128 KB│ │128 KB│     │
+│  │ L1   │ │ L1   │         │ L1   │ │ L1   │     │
+│  │ + ShM│ │ + ShM│         │ + ShM│ │ + ShM│     │
+│  └──┬───┘ └──┬───┘         └──┬───┘ └──┬───┘     │
+│     └────────┴─────────────────┴────────┘        │
+│                      │                            │
+│             ┌────────┴────────┐                   │
+│             │   L2 Cache      │                   │
+│             │     2 MB        │                   │
+│             └────────┬────────┘                   │
+│                      │                            │
+│             ┌────────┴────────┐                   │
+│             │  4 × 32-bit     │                   │
+│             │  Mem Controllers │                   │
+│             └────────┬────────┘                   │
+└──────────────────────┼──────────────────────────┘
+                       │
+              ┌────────┴────────┐
+              │  4 GB GDDR6     │
+              │  128-bit 总线    │
+              │  192 GB/s        │
+              └─────────────────┘
+```
+
+### 完整规格表
+
+| 参数 | 值 | 来源 |
+|---|---|---|
+| **架构** | Ampere (GA107) | `nvidia-smi -q` |
+| **制程** | Samsung 8nm | TechPowerUp |
+| **SM 数量** | **20** | `cudaGetDeviceProperties()` |
+| **CUDA Cores** | 20 × 128 = **2,560** | Ampere spec |
+| **Tensor Cores** | 20 × 4 = **80** (第 3 代) | Ampere spec |
+| **L1 Cache** | **128 KB / SM**（共 2.5 MB） | Ampere spec |
+| **L1 与 Shared Memory** | **共享同一块 128 KB SRAM**，carveout 可配 | Ampere spec |
+| **Shared Memory** | 48 KB/block (static), 最大 100 KB/SM (dynamic) | `cudaGetDeviceProperties()` |
+| **L2 Cache** | **2 MB**（2,097,152 bytes） | `cudaGetDeviceProperties()` |
+| **寄存器** | 65,536 per SM, 65,536 per block (max) | `cudaGetDeviceProperties()` |
+| **Warp Size** | 32 线程 | `cudaGetDeviceProperties()` |
+| **最大线程/SM** | 1,536（48 warps） | `cudaGetDeviceProperties()` |
+| **最大 Block/SM** | 16 | `cudaGetDeviceProperties()` |
+| **Boost Clock** | **1,485 MHz** | `cudaGetDeviceProperties()` |
+| **显存** | 4 GB GDDR6, **128-bit** 位宽 | `nvidia-smi` |
+| **显存带宽** | **192 GB/s** | `cudaGetDeviceProperties()` |
+| **峰值 FP32** | **7.60 TFLOPS** | 2560 CUDA × 2 FMA × 1.485 GHz |
+| **Ridge Point** | 7,600 / 192 = **39.6 FLOP/Byte** | 计算 |
+| **FP64:FP32 性能比** | **1:64**（消费级故意阉割） | NVIDIA spec |
+
+### GPU 存储层次
+
+```
+   大小         延迟         带宽           作用域         管理方式
+   ─────────────────────────────────────────────────────────────
+   寄存器       ~256 KB/SM   0 cycles    极高 (~8 TB/s)  单线程       编译器自动
+   Shared Mem   0~100 KB/SM  ~20 cycles  极高 (~4 TB/s)  1 个 Block   你手动 __shared__
+   L1 Cache     0~128 KB/SM  ~28 cycles  极高 (~4 TB/s)  1 个 SM      硬件自动
+   L2 Cache     2 MB         ~200 cycles  高 (~400 GB/s) 全 GPU       硬件自动
+   HBM (显存)    4 GB         ~380 cycles  192 GB/s      全 GPU + CPU 你手动 cudaMalloc
+```
+
+**L1 和 Shared Memory 的 carveout 机制：**
+
+- Ampere (CC 8.6) 上，L1 cache 和 shared memory **共享每 SM 128 KB 的 SRAM**
+- 通过 `cudaFuncSetAttribute()` 配置分界线（支持 0/8/16/32/64/100 KB shared memory）
+- 你分配的 shared memory 越多，L1 cache 越少（反之亦然）
+- 默认配置下，static shared memory 最多 48 KB/block
+
+---
+
+## GPU Cache 验证实验
+
+**文件:** `softmax.cu`（L2 Cache Experiment 部分）
+
+**动机：** Softmax 的 3-phase 实现（read x for max → read x for sum → read x + write out）报告的 BW（按 3 reads + 1 write 模型算）= 247 GB/s = 128.7% of 192 GB/s 上限。这个"违反物理定律"的数字说明什么？
+
+### 实验设计
+
+同一个 data（1000 rows × 4096 × 4 bytes = 16.4 MB），两个 kernel 对比：
+
+| Kernel | 做了什么 | 预期 |
+|---|---|---|
+| **read-3-only** | 纯读 x 3 次，零计算，零写入 | 若全走 HBM → 0.256 ms 理论下限 |
+| **normal softmax** | 3 reads + 1 write + 2 reduces + exp 计算 | 应 ≥ read-3-only + 写入 + 计算开销 |
+
+### 结果
+
+```
+Read-3-only 实测:              0.102 ms
+理论下限 (3 reads @ 192 GB/s): 0.256 ms
+                                    ↑
+                         0.102 < 0.256 → 违反物理定律！
+```
+
+**若假设只有第 1 次读走 HBM，第 2、3 次命中 L2：**
+
+| 假设 | 数据量 | @192 GB/s 最小时间 | 0.102 ms 可能吗? |
+|---|---|---|---|
+| 3 次全走 HBM | 49.2 MB | 0.256 ms | ❌ 不可能 |
+| 2 次走 HBM | 32.8 MB | 0.171 ms | ❌ 不可能 |
+| **只有第 1 次走 HBM** | **16.4 MB** | **0.085 ms** | ✅ **可能 (160 GB/s)** |
+
+**结论：同一份数据在几微秒内被读 3 次，第 1 次从 HBM 搬到 L2 后，后续 2 次直接从 L2 走，没出芯片。**
+
+### 为什么数据没被踢出 L2？
+
+```
+每个 row = 4,096 × 4 bytes = 16 KB
+一轮执行 = 20 个 SM × 1 block/SM = 20 个 block 同时跑
+同时活跃数据 = 20 × 16 KB = 320 KB
+L2 = 2,048 KB
+
+320 KB << 2,048 KB → 6 倍余量！所有活跃 row 数据都装得进 L2
+```
+
+加上 Phase 间的 reduce 计算（几百个 cycle）远短于 cache line 被 evict 的时间窗口，数据安静地待在 L2 里直到 Phase 2/3 再次被读。
+
+### 什么时候 L2 帮不了忙？
+
+如果 `HIDDEN_SIZE = 32768`（每 row = 128 KB）：
+
+```
+20 × 128 KB = 2,560 KB > 2,048 KB L2 → 装不下！
+Phase 2 再读时，早期 row 的数据已被后来的 row 踢出 L2 → 重新从 HBM 读
+```
+
+---
+
+## Softmax: 第一个"多 Reduce"融合 Kernel
+
+**文件:** `softmax.cu`, `softmax.py`
+
+```
+Softmax(x_i) = exp(x_i - max) / sum(exp(x_j - max))
+
+3 个 Phase:
+  Phase 1: read x → reduce (MAX)   → broadcast max
+  Phase 2: read x → reduce (SUM of exp(x-max)) → broadcast sum
+  Phase 3: read x → exp(x_i-max) / sum → write out
+```
+
+### 初始性能对比 (1000 rows × 4096 hidden)
+
+| | 时间 | 备注 |
+|---|---|---|
+| **PyTorch eager** | **0.198 ms** | 比我们快！为什么？ |
+| Our CUDA (3-phase) | 0.265 ms | 3 reads + 1 write |
+| RMSNorm (参考) | 0.248 ms | 1 read + 1 write（对比基准） |
+
+### 为什么 PyTorch 比我们快？
+
+PyTorch 很可能使用 **在线 Softmax 算法（1-pass）**——在单次遍历中同时累积 max 和 sum：
+
+```c
+// Online softmax — 读一次完成两个 reduce
+float m = -INFINITY, d = 0.0f;
+for each x_i:
+    float new_m = max(m, x_i);
+    d = d * exp(m - new_m) + exp(x_i - new_m);  // 调旧 sum 到新 max 尺度
+    m = new_m;
+// 至此, max 和 sum 都算完了 → 再读一次写输出即可
+// 内存: 2 reads + 1 write (vs 我们的 3 reads + 1 write)
+```
+
+**我们的 kernel 读了 x 3 次；在线算法只读 2 次 → 减少 25% 内存流量。下一步优化方向。**
+
+---
+
 ## 学习路线与知识体系
 
 ```
 ✅ Element-wise  (hot_loop.cu)          — 完美并行, 带宽瓶颈
 ✅ Reduce        (reduce.cu)            — 树状归约, warp shuffle, 超过 PyTorch
 ✅ RMSNorm       (rms_norm.cu)          — kernel 融合: reduce + element-wise
-🔜 Softmax       — online 算法, 数值稳定性 (exp(x - max))
+🔜 Softmax       — 3-phase 实现 + L2 验证完成，待优化: online 算法
 🔜 LayerNorm     — 两个 reduce + element-wise 融合
 🔜 MatMul/GEMM   — tiling, shared memory, Tensor Core, 算力瓶颈
 ```
@@ -384,3 +565,6 @@ RMSNorm 时间线:
 - **AI (Arithmetic Intensity) 决定优化方向** — AI << ridge → 带宽瓶颈，代码再优化也没用；AI >> ridge → 算力瓶颈，需要改计算方式
 - **专用 > 通用** — 手写专用 kernel 总能超过库函数（ATen/cuBLAS），因为库要处理通用情况
 - **Nsight Compute 是终极武器** — 硬件计数器告诉你每条指令的执行次数，消除所有猜测
+- **L2 Cache 对多 pass 算法有隐患** — 如果你的数据 fits in L2 (工作集 < 2 MB)，重复读取看起来"免费"（纯 read-only kernel 跑出 128% 理论 BW），会让你误以为内存不是瓶颈。但数据一大就暴露真相。这就是为什么 benchmark 要测多种数据规模
+- **L1 和 Shared Memory 是零和博弈** — 同一块 128 KB SRAM，分给 shared memory 多了 L1 就少。每个 kernel launch 所需的 shared memory bytes 直接决定 SM 能同时驻留多少 block（occupancy）
+- **写代码验证 > 相信推理** — 几次"推理看起来很对、代码跑出来打脸"的教训：读写混合 vs reduce sync 谁拖慢 BW？L2 到底帮了多少忙？Agent 也会错，benchmark 才是真理
