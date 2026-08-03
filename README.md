@@ -22,8 +22,17 @@
 | `bench_reduce.cu` | Fair benchmark: 手写 CUDA vs PyTorch reduce | `nvcc -o bench_reduce bench_reduce.cu && ./bench_reduce` |
 | `rms_norm.cu` | CUDA RMSNorm kernel (reduce + element-wise 融合) | `nvcc -o rms_norm_cuda rms_norm.cu && ./rms_norm_cuda` |
 | `rmsnorm_torch.py` | PyTorch RMSNorm benchmark baseline | `python rmsnorm_torch.py` |
-| `softmax.cu` | CUDA Softmax kernel (2 reduces + element-wise) + L2 验证实验 | `nvcc -o softmax_cuda softmax.cu && ./softmax_cuda` |
+| `softmax.cu` | CUDA Softmax kernel (V1/V2/V3) + L2 验证 + 用户 MyOwn | `nvcc -o softmax_cuda softmax.cu && ./softmax_cuda` |
 | `softmax.py` | PyTorch Softmax benchmark baseline | `python softmax.py` |
+| `softmax_beat.cu` | V4: register-cached online, hidden=8192/16384, 超 PyTorch | `nvcc -o softmax_beat softmax_beat.cu && ./softmax_beat` |
+| `softmax_final.cu` | V1 vs MyOwn vs PyTorch 跨尺寸对比 | `nvcc -o softmax_final softmax_final.cu && ./softmax_final` |
+| `big_sizes.cu` | Register cache vs online 大 hidden (32768/65536) 对比 | `nvcc -o big_sizes big_sizes.cu && ./big_sizes` |
+| `isolate.cu` | 隔离实验：register cache vs online 谁贡献大 | `nvcc -o isolate isolate.cu && ./isolate` |
+| `v3v4.cu` | V3 vs V4 寄存器家族同台对比 | `nvcc -o v3v4 v3v4.cu && ./v3v4` |
+| `softmax_scale.py` | PyTorch softmax 多尺寸 benchmark | `python softmax_scale.py` |
+| `verify_l2_overflow.cu` | read-3-only 实验：L2 溢出边界测量 | `nvcc -o verify_l2_overflow verify_l2_overflow.cu && ./verify_l2_overflow` |
+| `verify_stack.cu` | ncu 验证 B kernel 栈帧和 occupancy | `nvcc -o verify_stack verify_stack.cu` |
+| `verify_ldg.cu` | ncu 验证 MyOwn vs V4 的 LDG 指令数差异 | `nvcc -o verify_ldg verify_ldg.cu` |
 | `trace_torch_sum.py` | 查 torch.sum 底层调了什么 kernel | `python trace_torch_sum.py` |
 | `numba_explained.py` | Numba 原理：JIT 编译、LLVM、类型推断 | 阅读 |
 | `numba_howto.py` | Numba 实操：`@njit`、`prange`、常见坑 | 阅读 |
@@ -499,43 +508,125 @@ Phase 2 再读时，早期 row 的数据已被后来的 row 踢出 L2 → 重新
 
 ---
 
-## Softmax: 第一个"多 Reduce"融合 Kernel
+## Softmax: Kernel 演化全记录
 
-**文件:** `softmax.cu`, `softmax.py`
+**文件:** `softmax.cu`, `softmax.py`, `softmax_beat.cu`, `big_sizes.cu`, `isolate.cu`, `v3v4.cu`
+
+### 算法
 
 ```
 Softmax(x_i) = exp(x_i - max) / sum(exp(x_j - max))
 
-3 个 Phase:
-  Phase 1: read x → reduce (MAX)   → broadcast max
-  Phase 2: read x → reduce (SUM of exp(x-max)) → broadcast sum
-  Phase 3: read x → exp(x_i-max) / sum → write out
+两种实现:
+  Naive 3-phase:  读 x (找 max) → reduce → 读 x (sum exp) → reduce → 读 x (归一化写)
+  Online:         读 x (在线算 max+sum) → merge-reduce → 读 x (归一化写)
 ```
 
-### 初始性能对比 (1000 rows × 4096 hidden)
-
-| | 时间 | 备注 |
-|---|---|---|
-| **PyTorch eager** | **0.198 ms** | 比我们快！为什么？ |
-| Our CUDA (3-phase) | 0.265 ms | 3 reads + 1 write |
-| RMSNorm (参考) | 0.248 ms | 1 read + 1 write（对比基准） |
-
-### 为什么 PyTorch 比我们快？
-
-PyTorch 很可能使用 **在线 Softmax 算法（1-pass）**——在单次遍历中同时累积 max 和 sum：
+### 在线 Softmax 算法（Online）
 
 ```c
-// Online softmax — 读一次完成两个 reduce
+// 在线累积 (m, d) — 一次遍历同时更新 max 和 sum
 float m = -INFINITY, d = 0.0f;
 for each x_i:
-    float new_m = max(m, x_i);
-    d = d * exp(m - new_m) + exp(x_i - new_m);  // 调旧 sum 到新 max 尺度
-    m = new_m;
-// 至此, max 和 sum 都算完了 → 再读一次写输出即可
-// 内存: 2 reads + 1 write (vs 我们的 3 reads + 1 write)
+    if (x_i > m):
+        d = d * exp(m - x_i) + 1.0f;   // 把旧 sum 调新 max 尺度 + 新元素的 exp
+        m = x_i;
+    else:
+        d += exp(x_i - m);              // 在现有 max 尺度下累积
+// 最后 d = sum(exp(x_j - m))
 ```
 
-**我们的 kernel 读了 x 3 次；在线算法只读 2 次 → 减少 25% 内存流量。下一步优化方向。**
+**跨线程合并 (merge_pair)：** 两组 (m_a, d_a) 和 (m_b, d_b) 合并成一组：
+
+```c
+merge( (m_a,d_a), (m_b,d_b) ):
+  m = max(m_a, m_b)
+  d = d_a * exp(m_a - m) + d_b * exp(m_b - m)   // 各自换算到新 max, 再求和
+```
+
+这个 merge 替换了 naive 的两步 reduce（先 max 后 sum）为一步。
+
+### Kernel 演化：五种版本
+
+| 版本 | 内存模型 | 算法 | 适用 hidden |
+|---|---|---|---|
+| **V1 (naive)** | 3R+1W | 三遍读，分别找 max、sum、归一化 | 通用 |
+| **V2/MyOwn (online)** | 2R+1W | 在线 merge-pair reduce | ≥4096（通用） |
+| **V3 (reg-cached)** | 1R+1W | naive 3-phase, x_reg[16] 存寄存器 | ≤4096（编译期常量） |
+| **V4_32 (reg-cached)** | 1R+1W | online merge, x_reg[32] 存寄存器 | 8192（编译期常量） |
+| **V4_64 (reg-cached)** | 1R+1W | online merge, x_reg[64] 存寄存器 | 16384（编译期常量） |
+
+### 最终性能对比（1000 rows）
+
+```
+hidden     V1(naive)  MyOwn(online)  V3/V4(reg)  PyTorch   最佳 vs PyTorch
+4096       0.265 ms   0.265 ms       0.182 ms     0.198 ms   V3: 1.08x ✅
+8192       0.708 ms   0.550 ms       0.363 ms     0.370 ms   V4_32: 1.02x ✅
+16384      1.443 ms   1.094 ms       0.727 ms     0.887 ms   V4_64: 1.22x ✅
+32768      2.873 ms   2.180 ms       崩了(栈)     2.818 ms   MyOwn: 1.29x ✅
+65536      5.730 ms   4.338 ms       崩了(栈)     5.677 ms   MyOwn: 1.31x ✅
+```
+
+**所有尺寸都超过了 PyTorch。**
+
+### 核心 Insight
+
+**1. Register Cache (1R+1W) 是最强优化——但只在数据装得下寄存器时有用。**
+
+```
+x_reg[16]  (hidden=4096):  34 regs, 0 spill, 6 blocks/SM  ← 完美
+x_reg[32]  (hidden=8192):  70 regs, 0 spill, 3 blocks/SM  ← 还行
+x_reg[64]  (hidden=16384): 110 regs, 0 spill, 2 blocks/SM ← 勉强
+x_reg[128] (hidden=32768): 38 regs + 512B stack frame     ← 编详器放弃，全栈!
+```
+
+**"0 spill" 不意味数据在寄存器——也可能从没进过寄存器。** nvcc 判断数组太大时就分配在栈（local memory）。`x_reg[128]` 的 512 bytes stack frame 就是个例子——38 regs 全给标量，128 个 float 全在栈。栈读 = LDL 指令 = L1 → L2 → HBM，反而比 C 的明式 2R+1W 多了一倍流量。
+
+**2. 编译期常量 vs 运行时变量——register cache 的生死线。**
+
+```c
+// ✅ 编译期常量 → 编译器完全展开 → 寄存器
+const int ITEMS = 32;
+float x_reg[ITEMS];  // 编译器知道有 32 个 → 分配给 32 个物理寄存器
+
+// ❌ 运行时变量 → 编译器无法展开 → 栈
+int items = hs / tt;
+float x_reg[16];     // 即使只用了 16 个，动态下标 x_reg[i] 迫使编译器保守处理
+for (int i = 0; i < items; i++) x_reg[i] = ...;  // 可能触发栈分配
+```
+
+**3. 大 hidden 时 online (2R+1W) 是最优解。**
+
+hidden≥32768 时 register cache 崩了。online 的 2R+1W 是唯一方案——24 regs, 6 blocks/SM, 94% BW。merge_pair 多出的 255 次 exp 调用不随 hidden 增长，而省下的内存读随 hidden 线性放大。
+
+**4. Nsight Compute 验证了每个关键假设。**
+
+| 假设 | ncu 验证 |
+|---|---|
+| L1 在 hidden≥8192 时崩 | `L1 Hit = 0%` (6 blocks × 32 KB = 192 KB > 128 KB L1) |
+| L2 能部分缓存 re-read | `L2 Hit = 33%` (C) or `25%` (V1, 1000 rows) |
+| register cache 的栈读 miss L1 | `L1 Hit = 0%`, 640 KB 栈/SM >> 128 KB L1 |
+| 栈拖慢调度器 | B: `Eligible Warps = 0.19/Scheduler` vs C: `0.48` |
+| 栈把流量翻倍 | B: `5 ops/element`, C: `3 ops/element`, 时间比 = 1.67x |
+
+**5. `__syncthreads()` 规则。**
+
+任何线程 A 写了 shared memory，线程 B（B ≠ A）要读这个位置，中间必须夹一个 `__syncthreads()`。同一个 warp 内的 `__shfl_down_sync` 不需要 sync（warp 内锁步执行）。
+
+---
+
+### 技术工具箱（本次新增）
+
+| 工具 | 命令 | 作用 |
+|---|---|---|
+| 寄存器/spill/栈 | `nvcc -Xptxas -v` | 看每个 kernel 用了多少 regs、有无 spill、栈多大 |
+| SASS 反汇编 | `cuobjdump -sass binary` | 看最终机器码——真实指令数、LDS/STS 次数 |
+| PTX 中间码 | `nvcc -ptx file.cu` | 看虚拟指令（跨 GPU 代际通用） |
+| ncu Occupancy | `ncu --section Occupancy` | 哪个资源限制了 block 数（regs/smem/warps） |
+| ncu SchedulerStats | `ncu --section SchedulerStats` | warp eligible 比例、issued 频率 |
+| ncu WarpStateStats | `ncu --section WarpStateStats` | warp 为什么 stall（L1TEX/smem/barrier） |
+| ncu MemoryWorkload | `ncu --section MemoryWorkloadAnalysis` | L1/L2 hit rate、Memory Throughput、Mem Pipes Busy |
+| ncu cache line 级别 | `--metrics l1tex__t_sectors...` | 精确到 sector (32-byte) 的 L1/L2/HBM 计数器 |
 
 ---
 
@@ -545,7 +636,7 @@ for each x_i:
 ✅ Element-wise  (hot_loop.cu)          — 完美并行, 带宽瓶颈
 ✅ Reduce        (reduce.cu)            — 树状归约, warp shuffle, 超过 PyTorch
 ✅ RMSNorm       (rms_norm.cu)          — kernel 融合: reduce + element-wise
-🔜 Softmax       — 3-phase 实现 + L2 验证完成，待优化: online 算法
+✅ Softmax       (softmax.cu...)        — online 算法, register cache, L1/L2 验证
 🔜 LayerNorm     — 两个 reduce + element-wise 融合
 🔜 MatMul/GEMM   — tiling, shared memory, Tensor Core, 算力瓶颈
 ```
@@ -564,7 +655,8 @@ for each x_i:
 - **Kernel fusion 是最重要的优化** — PyTorch eager 多个 kernel = 多次显存读写，融合后一次通过
 - **AI (Arithmetic Intensity) 决定优化方向** — AI << ridge → 带宽瓶颈，代码再优化也没用；AI >> ridge → 算力瓶颈，需要改计算方式
 - **专用 > 通用** — 手写专用 kernel 总能超过库函数（ATen/cuBLAS），因为库要处理通用情况
-- **Nsight Compute 是终极武器** — 硬件计数器告诉你每条指令的执行次数，消除所有猜测
-- **L2 Cache 对多 pass 算法有隐患** — 如果你的数据 fits in L2 (工作集 < 2 MB)，重复读取看起来"免费"（纯 read-only kernel 跑出 128% 理论 BW），会让你误以为内存不是瓶颈。但数据一大就暴露真相。这就是为什么 benchmark 要测多种数据规模
-- **L1 和 Shared Memory 是零和博弈** — 同一块 128 KB SRAM，分给 shared memory 多了 L1 就少。每个 kernel launch 所需的 shared memory bytes 直接决定 SM 能同时驻留多少 block（occupancy）
-- **写代码验证 > 相信推理** — 几次"推理看起来很对、代码跑出来打脸"的教训：读写混合 vs reduce sync 谁拖慢 BW？L2 到底帮了多少忙？Agent 也会错，benchmark 才是真理
+- **Register Cache (1R+1W) 是杀手锏，但有硬限制** — 数组必须是编译期常量大小，且不能超过 ~64 floats/线程。超过就崩——编译器把数组扔栈，1R+1W 变 5 ops/element
+- **Nsight Compute 消除一切猜测** — 硬件计数器告诉你 L1/L2 命中率、warp 为什么 stall、内存管线忙不忙。不要推理，跑 ncu
+- **L1 和 Shared Memory 是零和博弈** — 同一块 128 KB SRAM，分给 shared memory 多了 L1 就少
+- **`nvcc -Xptxas -v` 是第一道检查** — "0 spill" 不代表数据全在寄存器，stack frame > 0 说明数组被扔栈上了
+- **写代码验证 > 相信推理** — 几次教训：读写混合 vs reduce sync？L2 做了多少？register cache 在大 size 时为什么崩？每次都靠 ncu + benchmark 给答案
