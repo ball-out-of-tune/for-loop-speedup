@@ -1,7 +1,7 @@
-# Python For-Loop Speedup
+# GPU Kernel Lab 🚀
 
-热循环性能加速实验：纯 Python → NumPy → Numba → GPU。
-从 0.35s 到 0.049 ms，**加速 7,100 倍，摸到硬件天花板。**
+从零手写 CUDA kernel：Element-wise → Reduce → Softmax → GEMM → Flash Attention。
+**从 Python for-loop (0.35s) 到 5090 GEMM (290 TFLOPS)，一路摸到硬件天花板。**
 
 ## 文件说明
 
@@ -660,3 +660,219 @@ hidden≥32768 时 register cache 崩了。online 的 2R+1W 是唯一方案—�
 - **L1 和 Shared Memory 是零和博弈** — 同一块 128 KB SRAM，分给 shared memory 多了 L1 就少
 - **`nvcc -Xptxas -v` 是第一道检查** — "0 spill" 不代表数据全在寄存器，stack frame > 0 说明数组被扔栈上了
 - **写代码验证 > 相信推理** — 几次教训：读写混合 vs reduce sync？L2 做了多少？register cache 在大 size 时为什么崩？每次都靠 ncu + benchmark 给答案
+
+---
+
+## GEMM: 矩阵乘法 — 从 0.45 TFLOPS 到超过 PyTorch
+
+**文件:** `gemm/sgemm.cu`, `gemm/tensorcore_gemm.cu`, `gemm/gemm_async_wmma.cu`, `gemm/gemm_blackwell.cu`
+
+### 第一阶段：CUDA Core FP32 (V1-V4)
+
+| 版本 | 技术 | 1024² | 4096² | 关键发现 |
+|------|------|-------|-------|----------|
+| V1 | Naive 全局内存 | 0.47T | 0.44T | HBM 带宽瓶颈，每次 FMA 要 2 次 HBM 读 |
+| V2 | 16×16 Shared Memory Tiling | 0.65T | 0.65T | 共享内存让数据复用 16 次 |
+| V3 | 32×32 Tile + 2×2 Register Block | 1.30T | 1.17T | 寄存器缓存增加复用 |
+| **V4** | **64×64 Tile + float4 向量化** | **3.57T** | **2.96T** | CUDA Core 天花板，达 cuBLAS FP32 的 78% |
+
+### 第二阶段：Tensor Core FP16 (V1-V9)
+
+Tensor Core 需要 FP16 输入。加转换 kernel: `f32tof16` (开销可忽略)。
+
+| 版本 | 技术 | 1024² | 4096² | 关键发现 |
+|------|------|-------|-------|----------|
+| V1 (WMMA) | 1 WMMA/warp, shared mem | 2.49T | 3.22T | `__syncthreads()` 开销占主导 |
+| V4 (WMMA) | 16 WMMA/warp, 128×128 tile | — | 7.23T | 提高 WMMA/sync 比值是关键 |
+| V8 (WMMA) | 去掉 shared mem, warp-parallel | — | 9.86T | `__syncthreads()` 消除后大幅提升 |
+| **V9 (WMMA)** | **cp.async 双缓冲 + 4 warps** | **11.66T (104% PT!)** | **13.10T (89% PT)** | **cp.async 是游戏改变者** |
+
+**V9 是 3050 Ti 的最终版本。** cp.async 双缓冲让加载和计算重叠，流水线永不空闲。
+
+### 核心优化技术栈
+
+```
+V1 0.45T → V9 13.1T = 29× 提升
+
+优化层次:
+  Shared Memory Tiling          → +1.4× (数据复用)
+  Register Blocking             → +2×   (寄存器缓存)
+  float4 向量化加载              → +1.5× (减少 load 指令)
+  Tensor Core (WMMA FP16)       → +2.5× (专用硬件)
+  cp.async 双缓冲                → +1.3× (load/compute 重叠)
+  gencode=sm_86 JIT 优化        → +1.4× (运行时 SASS 优化)
+```
+
+### 编译参数 (关键!)
+
+```bash
+# -arch=sm_86    → 只嵌入 SASS   → 1024² = 8.5T (76% PT)
+# -gencode=arch=compute_86,code=sm_86  → SASS + PTX → 1024² = 11.7T (104% PT!)
+# 同时嵌入 PTX 让驱动在加载时做 JIT 优化 → +37%!
+nvcc -o gemm_async gemm_async_wmma.cu \
+  -gencode=arch=compute_86,code=sm_86 \
+  -O3 -Xptxas -O3 --fmad=true -use_fast_math --restrict
+```
+
+### 3050 Ti 最终结果
+
+| size | TFLOPS | % of PyTorch FP16 |
+|------|--------|-------------------|
+| 1024² | **11.66 T** | **104%** ✅ |
+| 2048² | **12.33 T** | **92%** |
+| 4096² | **13.10 T** | **89%** |
+
+### WMMA API 的天花板
+
+4096² 只能达到 89% PT，根本原因：
+- WMMA 固定 K=16 per `mma_sync` → 4096/16 = **256 次 `__syncthreads()`**
+- 每次 barrier ~50 cycles → 串行 overhead 不可消除
+- 增大 K-step 到 32 需要更多共享内存 → 占用率下降 → 总体更差
+
+cuBLAS 绕过这层的方式：**PTX `mma.sync` + split-K 并行 + 手写指令调度** — WMMA C++ API 做不到。
+
+---
+
+## RTX 5090 (Blackwell SM 120) — 170 SMs, 32 GB
+
+**文件:** `gemm/gemm_blackwell.cu`
+
+### GPU 规格
+
+```
+GPU: NVIDIA GeForce RTX 5090
+Compute Capability: 12.0 (Blackwell)
+SM: 170 (8.5× 3050 Ti)
+Shared Memory: 48 KB default / 99 KB opt-in
+Max Threads/SM: 1536
+Memory: 32 GB GDDR7, ~1.79 TB/s
+PyTorch: 2.8.0+cu128
+```
+
+### GEMM 结果 — V2 超过 PyTorch
+
+| Kernel | 1024² | 2048² | 4096² | 8192² |
+|--------|-------|-------|-------|-------|
+| V9 port (128×128, K=16) | 28% | 89% | 79% | 90% |
+| **V2 (256×128, K=32, 8w)** | 30% | **108%** ✅ | **112%** ✅ | **134%** ✅ |
+
+**V2 设计:** 256×128 tile, 8 warps (256 threads), K=32 双缓冲, 48KB smem。
+- 170 SM 上大 tile 更高效（更多并行）
+- K=32 减半 sync 次数
+- 1024² 需要小 tile（多 block 填满 SM）
+
+### Flash Attention 基准 (PyTorch SDPA)
+
+| Seqlen | Flash | Manual O(N²) | Speedup |
+|--------|-------|-------------|---------|
+| 1024 | 0.02ms / 100T | 0.1ms | 3.4x |
+| 2048 | 0.06ms / 155T | 0.4ms | 7.4x |
+| 4096 | 0.21ms / 166T | 2.0ms | 9.7x |
+| 8192 | 0.51ms / 264T | 8.4ms | 10.5x |
+
+Flash Attention 在 8192 时 TFLOPS 超过 GEMM (264T vs 217T) — FLOPs 计算方式不同。
+
+---
+
+## Flash Attention: 从 PyTorch 到 CUDA Kernel
+
+**文件:** `flash_attn/flash_attn_v2.cu` (精度 ✅), `flash_attn/flash_attn_wmma.cu` (WMMA 尝试)
+
+### PyTorch 用法 — 一行代码
+
+```python
+import torch.nn.functional as F
+out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+# PyTorch 自动选后端: Flash Attn → Mem-Efficient → Math
+```
+
+### Flash Attention 算法
+
+```
+For each Q block (Br rows):
+  For each K,V block (Bc rows):
+    S = Q_block @ K_block^T     ← GEMM #1
+    P = softmax(S)              ← online, in SRAM
+    O_block += P @ V_block      ← GEMM #2
+O_block = O_block / l           ← normalize at end
+```
+
+**关键:** O(N²) attention matrix **从不存在于 HBM 中** — 在 SRAM 里算完就扔。
+
+### 自定义 CUDA Kernel 进展
+
+| 版本 | 精度 | 速度 | 状态 |
+|------|------|------|------|
+| flash_attn_v2.cu | ✅ Err=0.0000 | 0.04-2.0 T (慢 50-600x) | 精度正确，待加速 |
+| flash_attn_wmma.cu | ❌ | — | WMMA fragment 寄存器超限崩溃 |
+| gemm_attn_v2.cu | ❌ | — | GEMM-based attention，边界越界 |
+
+### 核心难题
+
+**WMMA accumulator fragment 不能逐元素 rescale。** Online softmax 需要 `O *= exp(m_old - m_new)` — 但 WMMA fragment 没有 `scale()` 方法。必须把 O 存在共享内存里做 element-wise 操作，牺牲速度换正确性。
+
+### 修复的关键 Bug
+
+**rmax/rsum 放在线程本地栈数组 → 跨线程读取到未初始化内存。**
+- 现象: O 值随机 inf, MaxErr = 数千
+- 修复: 移到 `__shared__` 共享内存，`__syncthreads()` 保证可见性
+- 修复后: MaxErr = 0.0000
+
+### 共享内存溢出
+
+Br=64 时 `Ps[64][64] (FP32)` + `Os[64][64] (FP32)` = 56KB > 48KB 默认。
+5090 直接编译报错，3050 Ti 静默数据破坏。减到 Br=32 解决。
+
+---
+
+## 优化方法论
+
+### GEMM 优化的关键维度
+
+1. **WMMA per sync 比值** — 最重要的指标。V1: 1 WMMA/sync → V9: 16 WMMA/sync (16×)
+2. **共享内存 vs 占用率** — 更多 smem = 更大的 tile = 更多数据复用，但减少同时驻留的 block 数
+3. **cp.async 双缓冲** — 加载与计算重叠，原理类似 CPU 的 software prefetching
+4. **编译参数** — `-gencode` > `-arch`，嵌入 PTX 让驱动 JIT 优化
+5. **寄存器是硬上限** — 128 regs/thread，WMMA accumulator 每个 fragment = 8 regs
+
+### Flash Attention 的额外维度
+
+6. **在线 softmax 与 WMMA 的冲突** — fragment 不能 rescale → 必须走共享内存
+7. **两遍 dot product vs 共享内存存 S** — 空间换时间，但 smem 有限
+8. **FP32 vs FP16 中间存储** — P 用 half 精度导致 P@V 误差累积
+
+### 调试武器
+
+| 问题 | 方法 |
+|------|------|
+| Kernel 崩溃 | `cudaGetLastError()` 每步检查 |
+| 数值错误 | Python numpy 模拟 kernel 逻辑，逐行对比 |
+| 共享内存溢出 | `ptxas error: uses too much shared data` — 减 tile |
+| 寄存器超限 | `--maxrregcount` 或减少 WMMA fragment 数 |
+| 跨线程数据竞争 | 怀疑的数组全放 `__shared__` |
+
+---
+
+## 仓库结构
+
+```
+gpu-kernel-lab/
+├── gemm/                GEMM kernel (CUDA Core → WMMA → Blackwell)
+├── flash_attn/          Flash Attention kernel
+├── python/              PyTorch benchmark + visualization
+├── viz/                 GIF/PNG 可视化输出
+├── build/               编译脚本 (.bat)
+├── archive/             失败尝试和实验
+├── GEMM_OPTIMIZATION.md  完整优化记录
+└── SESSION_SUMMARY.md    最新 session 总结
+```
+
+## 学到的教训
+
+1. **"不要假设，写代码验证"** — 用户明确要求，每次硬件相关的假设都用 benchmark 验证
+2. **WSL GPU 有 ~11-26% 性能损失** — 小 seqlen 损失大，大 seqlen 可忽略
+3. **Windows 原生编译环境是噩梦** — MSVC + nvcc 路径问题，WSL heredoc 写 .cu 更可靠
+4. **共享内存溢出静默破坏数据** — 3050 Ti 不报错但输出全错，5090 直接编译报错
+5. **"0 spill" 不代表数据在寄存器** — 大局部数组被编译器扔栈上 (local memory = DRAM)
+6. **PTX `mma.sync` 是 WMMA 天花板的唯一出路** — 手动寄存器分配 + 指令级 K-pipelining
+7. **GEMM 优化和 Flash Attention 优化技术栈高度重叠** — cp.async, shared memory tiling, WMMA, 寄存器管理

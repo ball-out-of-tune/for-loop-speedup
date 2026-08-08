@@ -1,0 +1,149 @@
+/**
+ * Async WMMA: cp.async double buffer + FP16 WMMA
+ * Goal: overlap global->smem load with WMMA compute
+ *
+ * nvcc -o gemm_async gemm_async_wmma.cu -arch=sm_86
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <cuda_runtime.h>
+#include <mma.h>
+#include <cuda_fp16.h>
+#include <cooperative_groups.h>
+
+using namespace nvcuda;
+namespace cg = cooperative_groups;
+
+#define CUDA_CHECK(c) do{cudaError_t e=c;if(e!=cudaSuccess){fprintf(stderr,"CUDA %d\n",e);exit(1);}}while(0)
+
+// FP32->FP16 conversion
+__global__ void convert(int n, const float* src, half* dst) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half(src[i]);
+}
+
+// Async WMMA: double-buffered smem via cp.async, 4 warps (128 threads), 128x128 tile
+__global__ void gemm_async_wmma(int M, int N, int K,
+    const half* __restrict__ A, const half* __restrict__ B, float* __restrict__ C)
+{
+    int warp_id = threadIdx.x / 32;
+    int wy = warp_id / 2, wx = warp_id % 2;
+    int warpM = blockIdx.y * 128 + wy * 64;
+    int warpN = blockIdx.x * 128 + wx * 64;
+
+    // Double buffer: dbuf[2][rows][cols]
+    __shared__ half As_dbuf[2][128][16];
+    __shared__ half Bs_dbuf[2][16][128];
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a[4];
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b[4];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c[16];
+    for (int i = 0; i < 16; i++) wmma::fill_fragment(c[i], 0.0f);
+
+    auto block = cg::this_thread_block();
+
+    // Prefetch first tile (buf 0)
+    for (int i = threadIdx.x; i < 128*16; i += 128) {
+        int r = i / 16, c = i % 16;
+        As_dbuf[0][r][c] = (blockIdx.y*128+r < M) ? A[(blockIdx.y*128+r)*K + c] : __float2half(0.0f);
+    }
+    for (int i = threadIdx.x; i < 16*128; i += 128) {
+        int r = i / 128, c = i % 128;
+        Bs_dbuf[0][r][c] = (c < N) ? B[r*N + (blockIdx.x*128+c)] : __float2half(0.0f);
+    }
+    cg::sync(block);
+
+    int read_buf = 0;
+
+    for (int kb = 16; kb < K; kb += 16) {
+        int write_buf = 1 - read_buf;
+
+        // Start async copy of next tile using PTX cp.async
+        int k_next = kb;
+        for (int i = threadIdx.x; i < 128*16; i += 128) {
+            int r = i / 16, c = i % 16;
+            int gr = blockIdx.y * 128 + r, gc = k_next + c;
+            unsigned smem_addr = __cvta_generic_to_shared(&As_dbuf[write_buf][r][c]);
+            const half* global_ptr = (gr < M && gc < K) ? &A[gr * K + gc] : nullptr;
+            if (global_ptr)
+                asm("cp.async.ca.shared.global [%0], [%1], 2;\n" :: "r"(smem_addr), "l"(global_ptr));
+        }
+        for (int i = threadIdx.x; i < 16*128; i += 128) {
+            int r = i / 128, c = i % 128;
+            int gr = k_next + r, gc = blockIdx.x * 128 + c;
+            unsigned smem_addr = __cvta_generic_to_shared(&Bs_dbuf[write_buf][r][c]);
+            const half* global_ptr = (gr < K && gc < N) ? &B[gr * N + gc] : nullptr;
+            if (global_ptr)
+                asm("cp.async.ca.shared.global [%0], [%1], 2;\n" :: "r"(smem_addr), "l"(global_ptr));
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+
+        // WMMA compute from read_buf (while async copy runs in background)
+        for (int mi = 0; mi < 4; mi++)
+            wmma::load_matrix_sync(a[mi], &As_dbuf[read_buf][wy*64 + mi*16][0], 16);
+        for (int ni = 0; ni < 4; ni++)
+            wmma::load_matrix_sync(b[ni], &Bs_dbuf[read_buf][0][wx*64 + ni*16], 128);
+        for (int mi = 0; mi < 4; mi++)
+            for (int ni = 0; ni < 4; ni++)
+                wmma::mma_sync(c[mi*4+ni], a[mi], b[ni], c[mi*4+ni]);
+
+        // Wait for async copy to finish before swapping buffers
+        asm volatile("cp.async.wait_group 0;\n" ::);
+        cg::sync(block);
+        read_buf = write_buf;
+    }
+
+    // Compute last tile (read_buf has it)
+    {
+        for (int mi = 0; mi < 4; mi++)
+            wmma::load_matrix_sync(a[mi], &As_dbuf[read_buf][wy*64 + mi*16][0], 16);
+        for (int ni = 0; ni < 4; ni++)
+            wmma::load_matrix_sync(b[ni], &Bs_dbuf[read_buf][0][wx*64 + ni*16], 128);
+        for (int mi = 0; mi < 4; mi++)
+            for (int ni = 0; ni < 4; ni++)
+                wmma::mma_sync(c[mi*4+ni], a[mi], b[ni], c[mi*4+ni]);
+    }
+
+    for (int mi = 0; mi < 4; mi++)
+        for (int ni = 0; ni < 4; ni++)
+            wmma::store_matrix_sync(C + (warpM+mi*16)*N + warpN+ni*16,
+                                    c[mi*4+ni], N, wmma::mem_row_major);
+}
+
+int main() {
+    int M = 4096, N = 4096, K = 4096;
+    printf("Async WMMA test: M=N=K=%d\n", M);
+
+    float *hA = (float*)malloc(M*K*4), *hB = (float*)malloc(K*N*4);
+    for (size_t i = 0; i < (size_t)M*K; i++) hA[i] = (float)rand()/RAND_MAX-0.5f;
+    for (size_t i = 0; i < (size_t)K*N; i++) hB[i] = (float)rand()/RAND_MAX-0.5f;
+
+    float *dA32, *dB32, *dC;
+    half *dA16, *dB16;
+    CUDA_CHECK(cudaMalloc(&dA32, M*K*4)); CUDA_CHECK(cudaMalloc(&dB32, K*N*4));
+    CUDA_CHECK(cudaMalloc(&dA16, M*K*2)); CUDA_CHECK(cudaMalloc(&dB16, K*N*2));
+    CUDA_CHECK(cudaMalloc(&dC, M*N*4));
+    CUDA_CHECK(cudaMemcpy(dA32, hA, M*K*4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dB32, hB, K*N*4, cudaMemcpyHostToDevice));
+    convert<<<(M*K+255)/256,256>>>(M*K, dA32, dA16);
+    convert<<<(K*N+255)/256,256>>>(K*N, dB32, dB16);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    dim3 grid((N+127)/128, (M+127)/128), block(128);
+    for (int i = 0; i < 5; i++) gemm_async_wmma<<<grid,block>>>(M,N,K,dA16,dB16,dC);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaEvent_t s,e; CUDA_CHECK(cudaEventCreate(&s)); CUDA_CHECK(cudaEventCreate(&e));
+    CUDA_CHECK(cudaEventRecord(s));
+    for (int i = 0; i < 20; i++) gemm_async_wmma<<<grid,block>>>(M,N,K,dA16,dB16,dC);
+    CUDA_CHECK(cudaEventRecord(e));
+    CUDA_CHECK(cudaEventSynchronize(e));
+    float t; cudaEventElapsedTime(&t,s,e);
+    double flops = 2.0*M*N*K;
+    printf("Async WMMA: %.3f ms -> %.3f TFLOPS\n", t/20, flops/(t/20000)/1e12);
+
+    CUDA_CHECK(cudaFree(dA32)); CUDA_CHECK(cudaFree(dB32));
+    CUDA_CHECK(cudaFree(dA16)); CUDA_CHECK(cudaFree(dB16)); CUDA_CHECK(cudaFree(dC));
+    free(hA); free(hB);
+    return 0;
+}
